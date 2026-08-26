@@ -25,6 +25,7 @@ sukebei_scheduler — sukebei.nyaa.si 定时增量爬虫库
 import argparse
 import asyncio
 import json
+import os
 import random
 import re
 import sys
@@ -184,15 +185,20 @@ def local_max(state_file, initial_id):
 # 单轮抓取: [start_id, end_id]
 # ---------------------------------------------------------------------------
 async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, proxy_url,
-                      state_file, progress_cb=None):
+                      state_file, progress_cb=None, max_duration=0):
     """抓取 [start_id, end_id] 区间详情页, 追加写入 output jsonl。
 
-    返回 (已尝试数, 成功条数)。水位线随抓取推进, 每 WATERMARK_SAVE_EVERY 条落盘一次。
+    返回 (已尝试数, 成功条数, 剩余数)。
+    水位线随抓取推进, 每 WATERMARK_SAVE_EVERY 条落盘一次。
+    max_duration>0 时: 运行超过该秒数则停止入队新 ID, 保存水位线后正常返回剩余数
+    (由调用方决定是继续下一轮还是等定时)。
     """
     ids = list(range(start_id, end_id + 1))
     total = len(ids)
+    deadline = time.time() + max_duration if max_duration > 0 else None
     print(f"  [crawl] 区间 {start_id} ~ {end_id} ({total} 条) | 线程 {workers} "
-          f"| 延迟 {min_delay}-{max_delay}s | 输出 {output}")
+          f"| 延迟 {min_delay}-{max_delay}s | 输出 {output}"
+          + (f" | 时长上限 {max_duration}s" if max_duration > 0 else ""))
 
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     attempted = start_id - 1
@@ -264,24 +270,36 @@ async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, p
 
             q = asyncio.Queue(maxsize=workers * 20)
             tasks = [asyncio.create_task(worker()) for _ in range(workers)]
+            stopped_at = None
             for vid in ids:
+                # 达到时长上限: 停止入队新 ID, 剩余的交由下一轮
+                if deadline is not None and time.time() > deadline:
+                    stopped_at = vid
+                    break
                 await q.put(vid)
-            await q.join()
+            await q.join()  # 已在队列中的任务全部消费完
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             save_state(state_file, attempted)
+            remaining = max(0, end_id - attempted) if stopped_at is not None else 0
+            if stopped_at is not None:
+                print(f"  [timeout] 达时长上限, 已保存水位线 {attempted}, 剩余 {remaining} 个 ID 待下一轮",
+                      flush=True)
         finally:
             fh.close()
-    return attempted, found
+    return attempted, found, remaining
 
 
 # ---------------------------------------------------------------------------
 # 单轮决策: 比较本地 max 与网站最新 ID
 # ---------------------------------------------------------------------------
 async def check_and_crawl(initial_id, output, state_file, min_delay, max_delay,
-                          workers, proxy_url, progress_cb=None):
-    """执行一轮。返回 True 表示本轮抓取了新内容, False 表示无新内容。"""
+                          workers, proxy_url, progress_cb=None, max_duration=0):
+    """执行一轮。
+
+    返回 (是否有新内容, 剩余未抓 ID 数)。有剩余时调用方应续跑下一轮。
+    """
     start_id = local_max(state_file, initial_id) + 1
 
     print(f"[*] 本地水位线 max_attempted = {start_id - 1}")
@@ -292,31 +310,42 @@ async def check_and_crawl(initial_id, output, state_file, min_delay, max_delay,
     if site_max < start_id:
         print(f"[*] 无新内容 (最新 {site_max} < 本地起点 {start_id}), 停止本轮, 等下次定时执行")
         save_state(state_file, site_max)
-        return False
+        return False, 0
 
-    await crawl_range(start_id, site_max, output, min_delay, max_delay, workers,
-                      proxy_url, state_file, progress_cb)
-    print(f"[*] 本轮完成, 水位线推进至 {site_max}")
-    return True
+    attempted, found, remaining = await crawl_range(
+        start_id, site_max, output, min_delay, max_delay, workers,
+        proxy_url, state_file, progress_cb, max_duration=max_duration)
+    print(f"[*] 本轮完成: 已尝试至 {attempted}, 成功 {found}, 剩余 {remaining}")
+    return True, remaining
 
 
 # ---------------------------------------------------------------------------
 # 定时循环
 # ---------------------------------------------------------------------------
 def run_schedule(initial_id, output, state_file, interval, min_delay, max_delay,
-                 workers, proxy_url, once=False, progress_cb=None):
+                 workers, proxy_url, once=False, progress_cb=None, max_duration=0):
     """定时执行主循环: 每 interval 秒跑一轮 check_and_crawl。
 
     output 支持 {ts} 占位符, 每轮替换为运行时刻 (YYYYmmdd_HHMMSS),
     这样每轮生成独立文件, 不会把多轮数据混写进同一个文件。
+    max_duration>0: 每轮到点主动保存退出, 返回 (has_new, remaining)。
     """
     while True:
         started = time.time()
         # 每轮生成带时间戳的输出文件
         out_path = str(output).replace("{ts}", datetime.now().strftime("%Y%m%d_%H%M%S"))
         try:
-            asyncio.run(check_and_crawl(initial_id, out_path, state_file, min_delay,
-                                        max_delay, workers, proxy_url, progress_cb))
+            has_new, remaining = asyncio.run(
+                check_and_crawl(initial_id, out_path, state_file, min_delay,
+                                max_delay, workers, proxy_url, progress_cb,
+                                max_duration=max_duration))
+            if remaining > 0:
+                print(f"[*] 本轮超时中断, 剩余 {remaining} 个 ID, 由下一轮续跑", flush=True)
+            # GitHub Actions 输出: has_more=true 时工作流自触发下一轮
+            if os.environ.get("GITHUB_OUTPUT"):
+                with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                    f.write(f"has_more={'true' if remaining > 0 else 'false'}\n")
+                    f.write(f"remaining={remaining}\n")
         except KeyboardInterrupt:
             print("\n[!] 手动中断")
             break
@@ -342,6 +371,8 @@ def main(argv=None):
     p.add_argument("--state", default="sukebei_state.json", help="水位线状态文件")
     p.add_argument("--interval", type=int, default=3600, help="定时间隔（秒），默认 3600")
     p.add_argument("--once", action="store_true", help="只执行一轮就退出")
+    p.add_argument("--max-duration", type=int, default=0,
+                   help="单轮最大运行秒数，到点主动保存水位线并退出（0=不限）")
     p.add_argument("--min-delay", type=float, default=0.8)
     p.add_argument("--max-delay", type=float, default=1.3)
     p.add_argument("--workers", type=int, default=2)
@@ -351,7 +382,8 @@ def main(argv=None):
     print(f"[*] sukebei 定时爬虫 | initial={a.initial_id} | interval={a.interval}s "
           f"| once={a.once} | output={a.output}")
     run_schedule(a.initial_id, Path(a.output), Path(a.state), a.interval,
-                 a.min_delay, a.max_delay, a.workers, a.proxy, once=a.once)
+                 a.min_delay, a.max_delay, a.workers, a.proxy, once=a.once,
+                 max_duration=a.max_duration)
 
 
 if __name__ == "__main__":

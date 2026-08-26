@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  actions: write   # 用于自触发下一轮 (gh workflow run)
 
 concurrency:
   group: sukebei-scheduler
@@ -35,8 +36,11 @@ jobs:
       # ── 跑一轮定时爬虫 ──
       # 初始 ID 优先级: 手动触发输入 > 仓库变量 SUKEBEI_INITIAL_ID > 默认值
       # -u: 无缓冲输出，进度实时显示在 Actions 日志里
+      # --max-duration 3600: 满 1 小时主动保存水位线并正常退出（不靠 timeout 硬杀），
+      #   has_more=true 时由下方步骤自触发下一轮续跑
       - name: Run one scheduled round
-        timeout-minutes: 60
+        id: crawl
+        timeout-minutes: 75   # 保险丝，仅防脚本意外挂死；正常由 max-duration 主动退出
         env:
           INITIAL_ID: ${{ inputs.initial_id || vars.SUKEBEI_INITIAL_ID || '4693264' }}
         run: |
@@ -46,7 +50,8 @@ jobs:
             --state state/sukebei_state.json \
             --workers 3 \
             --min-delay 0.8 \
-            --max-delay 1.3
+            --max-delay 1.3 \
+            --max-duration 3600
 
       # ── 提交结果与水位线（下轮从这里继续） ──
       - name: Commit results
@@ -56,3 +61,14 @@ jobs:
           git add -A
           git diff --staged --quiet || git commit -m "auto: scheduled crawl results"
           git push
+
+      # ── 还有剩余 ID 就立即自触发下一轮，抓完为止；没有则等下一个定时 ──
+      - name: Re-trigger if IDs remain
+        if: steps.crawl.outputs.has_more == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "剩余 ${{ steps.crawl.outputs.remaining }} 个 ID，60 秒后触发下一轮..."
+          sleep 60
+          gh workflow run "Sukebei Scheduled Crawler" --ref main
+        # 注意: 自触发的新 run 会被 concurrency 组排队，等当前 run 完全结束后才开始

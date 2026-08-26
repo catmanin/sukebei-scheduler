@@ -46,6 +46,7 @@ python sukebei_scheduler.py --initial-id 4609903 --proxy socks5://127.0.0.1:1080
 | `--state` | `sukebei_state.json` | 水位线状态文件 |
 | `--interval` | `3600` | 定时间隔（秒） |
 | `--once` | off | 只执行一轮就退出 |
+| `--max-duration` | `0` | 单轮最大运行秒数，到点主动保存水位线并退出（0=不限） |
 | `--min-delay` / `--max-delay` | `0.8` / `1.3` | 请求间隔（秒） |
 | `--workers` | `2` | 并发数 |
 | `--proxy` | 无 | http(s)/socks 代理 |
@@ -53,6 +54,14 @@ python sukebei_scheduler.py --initial-id 4609903 --proxy socks5://127.0.0.1:1080
 ## GitHub Actions 定时执行
 
 仓库内置 `.github/workflows/scheduled-crawl.yml`，默认每天自动跑一轮（约 750 条/天的新 ID 一次即可覆盖），结果和状态自动提交回仓库（可 `workflow_dispatch` 手动触发一次，传入 `initial_id` 覆盖起始值）。
+
+### 超时与续跑机制（不硬杀）
+
+- 单轮设 `--max-duration 3600`（1 小时）：到点**主动保存水位线、正常退出**，不是靠 GitHub 超时强杀
+- 脚本把剩余数写入 `has_more` 输出；工作流读到 `has_more=true` 就 `gh workflow run` **自触发下一轮 runner**，一直续跑直到抓完
+- 没有剩余 ID 时 `has_more=false`，本轮结束，等下一个定时
+- `timeout-minutes: 75` 仅作为保险丝，防脚本意外挂死
+- 自触发的 run 被 concurrency 组排队，等当前 run 完全结束（水位线已 push）才开始，保证续跑拿到最新水位线
 
 ## 作为库使用
 
