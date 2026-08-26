@@ -43,7 +43,7 @@ jobs:
         id: crawl
         timeout-minutes: 95   # 保险丝（3300s + 重试排空余量），仅防脚本意外挂死
         env:
-          INITIAL_ID: ${{ inputs.initial_id || vars.SUKEBEI_INITIAL_ID || '4693264' }}
+          INITIAL_ID: ${{ inputs.initial_id || vars.SUKEBEI_INITIAL_ID || '4632039' }}
         run: |
           python3 -u sukebei_scheduler.py --once \
             --initial-id "$INITIAL_ID" \
