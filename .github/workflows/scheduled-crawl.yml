@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       initial_id:
-        description: '初始 ID（仅首次运行/重置水位线时用，之后以 state 文件为准）'
+        description: '初始 ID（仅当仓库无 state/sukebei_state.json 时生效；重置水位线请删除该文件后手动触发）'
         required: false
         type: string
 
@@ -36,11 +36,12 @@ jobs:
       # ── 跑一轮定时爬虫 ──
       # 初始 ID 优先级: 手动触发输入 > 仓库变量 SUKEBEI_INITIAL_ID > 默认值
       # -u: 无缓冲输出，进度实时显示在 Actions 日志里
-      # --max-duration 3600: 满 1 小时主动保存水位线并正常退出（不靠 timeout 硬杀），
+      # --max-duration 3300: 55 分钟后主动保存水位线并正常退出（不靠 timeout 硬杀），
+      #   留 40 分钟给队列排空（429 重试最坏 ~18 分钟）+ 提交步骤；
       #   has_more=true 时由下方步骤自触发下一轮续跑
       - name: Run one scheduled round
         id: crawl
-        timeout-minutes: 75   # 保险丝，仅防脚本意外挂死；正常由 max-duration 主动退出
+        timeout-minutes: 95   # 保险丝（3300s + 重试排空余量），仅防脚本意外挂死
         env:
           INITIAL_ID: ${{ inputs.initial_id || vars.SUKEBEI_INITIAL_ID || '4693264' }}
         run: |
@@ -51,7 +52,7 @@ jobs:
             --workers 3 \
             --min-delay 0.8 \
             --max-delay 1.3 \
-            --max-duration 3600
+            --max-duration 3300
 
       # ── 提交结果与水位线（下轮从这里继续） ──
       - name: Commit results

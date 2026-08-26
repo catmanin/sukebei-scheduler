@@ -41,11 +41,12 @@ python sukebei_scheduler.py --initial-id 4609903 --proxy socks5://127.0.0.1:1080
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--initial-id` | 必填 | 初始 ID（本地无状态时从它开始） |
+| `--initial-id` | 必填 | 初始 ID（仅当本地无状态文件时生效；已有状态则以状态文件为准） |
 | `--output` | `data/sukebei_{ts}.jsonl` | 输出 jsonl 文件（支持 `{ts}` 时间戳占位符） |
 | `--state` | `sukebei_state.json` | 水位线状态文件 |
 | `--interval` | `3600` | 定时间隔（秒） |
 | `--once` | off | 只执行一轮就退出 |
+| `--reset` | off | 删除状态文件，从 `--initial-id` 重新开始（重置水位线用） |
 | `--max-duration` | `0` | 单轮最大运行秒数，到点主动保存水位线并退出（0=不限） |
 | `--min-delay` / `--max-delay` | `0.8` / `1.3` | 请求间隔（秒） |
 | `--workers` | `2` | 并发数 |
@@ -53,14 +54,14 @@ python sukebei_scheduler.py --initial-id 4609903 --proxy socks5://127.0.0.1:1080
 
 ## GitHub Actions 定时执行
 
-仓库内置 `.github/workflows/scheduled-crawl.yml`，默认每天自动跑一轮（约 750 条/天的新 ID 一次即可覆盖），结果和状态自动提交回仓库（可 `workflow_dispatch` 手动触发一次，传入 `initial_id` 覆盖起始值）。
+仓库内置 `.github/workflows/scheduled-crawl.yml`，默认每天自动跑一轮（约 750 条/天的新 ID 一次即可覆盖），结果和状态自动提交回仓库（可 `workflow_dispatch` 手动触发一次）。注意：`initial_id` 仅在本地无状态文件时生效，**重置水位线需在仓库里删除 `state/sukebei_state.json`**（或用本地 `--reset`）。
 
 ### 超时与续跑机制（不硬杀）
 
-- 单轮设 `--max-duration 3600`（1 小时）：到点**主动保存水位线、正常退出**，不是靠 GitHub 超时强杀
+- 单轮设 `--max-duration 3300`（55 分钟）：到点**主动保存水位线、正常退出**，不是靠 GitHub 超时强杀
 - 脚本把剩余数写入 `has_more` 输出；工作流读到 `has_more=true` 就 `gh workflow run` **自触发下一轮 runner**，一直续跑直到抓完
 - 没有剩余 ID 时 `has_more=false`，本轮结束，等下一个定时
-- `timeout-minutes: 75` 仅作为保险丝，防脚本意外挂死
+- `timeout-minutes: 95` 仅作为保险丝，防脚本意外挂死（含 429 重试排空余量）
 - 自触发的 run 被 concurrency 组排队，等当前 run 完全结束（水位线已 push）才开始，保证续跑拿到最新水位线
 
 ## 作为库使用
@@ -68,8 +69,9 @@ python sukebei_scheduler.py --initial-id 4609903 --proxy socks5://127.0.0.1:1080
 ```python
 from sukebei_scheduler import run_schedule, check_and_crawl, crawl_range, parse_view
 
-# 单轮决策：比较本地 max 与网站最新 ID，返回 True=本轮抓了新内容
-has_new = await check_and_crawl(
+# 单轮决策：比较本地 max 与网站最新 ID
+# 返回 (has_new, remaining)：has_new=是否抓到新内容, remaining=超时未抓的剩余 ID 数
+has_new, remaining = await check_and_crawl(
     initial_id=4609903,
     output="data/sukebei_{ts}.jsonl",
     state_file="state/sukebei_state.json",

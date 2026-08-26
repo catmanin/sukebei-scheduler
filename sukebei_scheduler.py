@@ -51,6 +51,7 @@ H = {
 TIMEOUT = 25
 WATERMARK_SAVE_EVERY = 200          # 每抓 N 条保存一次水位线（崩溃安全）
 BACKOFF_429_SEC = 30                # 429 后的冷却
+MAX_RETRIES = 3                     # 429/网络错误/解析失败的最大重试次数
 
 # ---------------------------------------------------------------------------
 # 解析
@@ -220,24 +221,36 @@ async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, p
                         return
                     try:
                         # 内层 try/except 捕获所有请求错误 —— worker 永不崩溃
+                        # 429/网络错误/解析失败自动重试 MAX_RETRIES 次（退避），
+                        # 404 不重试（永久状态）；重试耗尽后记录状态并推进水位线
                         item = None
                         status = "error"
                         err_msg = ""
-                        try:
-                            await asyncio.sleep(random.uniform(min_delay, max_delay))
-                            resp = await session.get(VIEW_URL.format(vid), timeout=TIMEOUT)
-                            if resp.status_code == 404:
-                                status = "404"
-                            elif resp.status_code == 429:
-                                status = "429"
-                                await asyncio.sleep(BACKOFF_429_SEC)
-                            else:
+                        for attempt in range(1, MAX_RETRIES + 1):
+                            try:
+                                await asyncio.sleep(random.uniform(min_delay, max_delay))
+                                resp = await session.get(VIEW_URL.format(vid), timeout=TIMEOUT)
+                                if resp.status_code == 404:
+                                    status = "404"
+                                    break
+                                if resp.status_code == 429:
+                                    status = "429"
+                                    await asyncio.sleep(BACKOFF_429_SEC)
+                                    continue
                                 resp.raise_for_status()
                                 item = parse_view(resp.text, vid)
                                 status = "ok" if item else "parse_fail"
-                        except Exception as e:
-                            status = "error"
-                            err_msg = str(e)[:100]
+                                if item:
+                                    break
+                            except Exception as e:
+                                err_msg = str(e)[:100]
+                                status = "error"
+                            # 重试之间退避
+                            if attempt < MAX_RETRIES:
+                                await asyncio.sleep(BACKOFF_429_SEC)
+                        # 成功重试到 item 后, 清掉残留 err_msg
+                        if item:
+                            err_msg = ""
                         # 无论成功/404/429/错误/解析失败，每个 ID 都写入一条（带状态标记）
                         if item:
                             rec = item
@@ -309,7 +322,8 @@ async def check_and_crawl(initial_id, output, state_file, min_delay, max_delay,
 
     if site_max < start_id:
         print(f"[*] 无新内容 (最新 {site_max} < 本地起点 {start_id}), 停止本轮, 等下次定时执行")
-        save_state(state_file, site_max)
+        # 保持原水位线: site_max 可能是 RSS 缓存的旧值, 绝不能把水位线回退
+        save_state(state_file, start_id - 1)
         return False, 0
 
     attempted, found, remaining = await crawl_range(
@@ -324,11 +338,12 @@ async def check_and_crawl(initial_id, output, state_file, min_delay, max_delay,
 # ---------------------------------------------------------------------------
 def run_schedule(initial_id, output, state_file, interval, min_delay, max_delay,
                  workers, proxy_url, once=False, progress_cb=None, max_duration=0):
-    """定时执行主循环: 每 interval 秒跑一轮 check_and_crawl。
+    """定时执行主循环: 每 interval 秒跑一轮 check_and_crawl（不返回值）。
 
     output 支持 {ts} 占位符, 每轮替换为运行时刻 (YYYYmmdd_HHMMSS),
     这样每轮生成独立文件, 不会把多轮数据混写进同一个文件。
-    max_duration>0: 每轮到点主动保存退出, 返回 (has_new, remaining)。
+    max_duration>0: 每轮到点主动保存水位线退出; 有剩余时往 GITHUB_OUTPUT
+    写 has_more=true, 供 GitHub Actions 自触发下一轮。
     """
     while True:
         started = time.time()
@@ -350,7 +365,11 @@ def run_schedule(initial_id, output, state_file, interval, min_delay, max_delay,
             print("\n[!] 手动中断")
             break
         except Exception as e:
-            print(f"[!] 本轮异常: {e}")
+            print(f"[!] 本轮异常: {e}", flush=True)
+            if once:
+                # 单轮模式（Actions）: 异常直接失败退出, 让工作流看到红色失败,
+                # 而不是吞掉异常假装成功
+                raise
         if once:
             break
         elapsed = time.time() - started
@@ -371,6 +390,8 @@ def main(argv=None):
     p.add_argument("--state", default="sukebei_state.json", help="水位线状态文件")
     p.add_argument("--interval", type=int, default=3600, help="定时间隔（秒），默认 3600")
     p.add_argument("--once", action="store_true", help="只执行一轮就退出")
+    p.add_argument("--reset", action="store_true",
+                   help="忽略已有状态文件，从 --initial-id 重新开始（用于重置水位线）")
     p.add_argument("--max-duration", type=int, default=0,
                    help="单轮最大运行秒数，到点主动保存水位线并退出（0=不限）")
     p.add_argument("--min-delay", type=float, default=0.8)
@@ -380,7 +401,13 @@ def main(argv=None):
     a = p.parse_args(argv)
 
     print(f"[*] sukebei 定时爬虫 | initial={a.initial_id} | interval={a.interval}s "
-          f"| once={a.once} | output={a.output}")
+          f"| once={a.once} | output={a.output} | reset={a.reset}")
+    if a.reset:
+        # 重置: 清掉状态文件, 让 local_max 回落为 initial_id - 1
+        st_path = Path(a.state)
+        if st_path.exists():
+            st_path.unlink()
+            print(f"[*] 已删除状态文件 {a.state}, 水位线将从 {a.initial_id} 重新开始")
     run_schedule(a.initial_id, Path(a.output), Path(a.state), a.interval,
                  a.min_delay, a.max_delay, a.workers, a.proxy, once=a.once,
                  max_duration=a.max_duration)
