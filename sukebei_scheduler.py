@@ -215,25 +215,35 @@ async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, p
                     try:
                         # 内层 try/except 捕获所有请求错误 —— worker 永不崩溃
                         item = None
-                        msg = ""
+                        status = "error"
+                        err_msg = ""
                         try:
                             await asyncio.sleep(random.uniform(min_delay, max_delay))
                             resp = await session.get(VIEW_URL.format(vid), timeout=TIMEOUT)
                             if resp.status_code == 404:
-                                msg = "404(已删除)"
+                                status = "404"
                             elif resp.status_code == 429:
-                                msg = "429(冷却)"
+                                status = "429"
                                 await asyncio.sleep(BACKOFF_429_SEC)
                             else:
                                 resp.raise_for_status()
                                 item = parse_view(resp.text, vid)
-                                msg = "ok" if item else "parse_fail"
+                                status = "ok" if item else "parse_fail"
                         except Exception as e:
-                            msg = f"err:{str(e)[:60]}"
+                            status = "error"
+                            err_msg = str(e)[:100]
+                        # 无论成功/404/429/错误/解析失败，每个 ID 都写入一条（带状态标记）
                         if item:
-                            async with lock:
-                                fh.write(json.dumps(item, ensure_ascii=False) + "\n")
-                                fh.flush()
+                            rec = item
+                            rec["status"] = "ok"
+                        else:
+                            rec = {"id": vid, "status": status}
+                            if err_msg:
+                                rec["error"] = err_msg
+                        async with lock:
+                            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            fh.flush()
+                        if item:
                             found += 1
                         # 水位线推进（404/失败也算尝试过）
                         async with lock:
@@ -244,7 +254,7 @@ async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, p
                         done[0] += 1
                         # 每 50 条打印一次进度，防 Actions 管道缓冲
                         if done[0] % 50 == 0 or done[0] == total:
-                            print(f"    [{done[0]}/{total}] #{vid} {msg}", flush=True)
+                            print(f"    [{done[0]}/{total}] #{vid} {status}", flush=True)
                         if progress_cb:
                             progress_cb(vid, total, found)
                     except Exception as e:
@@ -295,11 +305,17 @@ async def check_and_crawl(initial_id, output, state_file, min_delay, max_delay,
 # ---------------------------------------------------------------------------
 def run_schedule(initial_id, output, state_file, interval, min_delay, max_delay,
                  workers, proxy_url, once=False, progress_cb=None):
-    """定时执行主循环: 每 interval 秒跑一轮 check_and_crawl。"""
+    """定时执行主循环: 每 interval 秒跑一轮 check_and_crawl。
+
+    output 支持 {ts} 占位符, 每轮替换为运行时刻 (YYYYmmdd_HHMMSS),
+    这样每轮生成独立文件, 不会把多轮数据混写进同一个文件。
+    """
     while True:
         started = time.time()
+        # 每轮生成带时间戳的输出文件
+        out_path = str(output).replace("{ts}", datetime.now().strftime("%Y%m%d_%H%M%S"))
         try:
-            asyncio.run(check_and_crawl(initial_id, output, state_file, min_delay,
+            asyncio.run(check_and_crawl(initial_id, out_path, state_file, min_delay,
                                         max_delay, workers, proxy_url, progress_cb))
         except KeyboardInterrupt:
             print("\n[!] 手动中断")
@@ -321,7 +337,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="sukebei.nyaa.si 定时增量爬虫")
     p.add_argument("--initial-id", type=int, required=True,
                    help="初始 ID（本地无状态时从它开始）")
-    p.add_argument("--output", default="sukebei.jsonl", help="输出 jsonl 文件")
+    p.add_argument("--output", default="data/sukebei_{ts}.jsonl",
+                   help="输出 jsonl 文件；支持 {ts} 占位符（每轮替换为运行时间戳）")
     p.add_argument("--state", default="sukebei_state.json", help="水位线状态文件")
     p.add_argument("--interval", type=int, default=3600, help="定时间隔（秒），默认 3600")
     p.add_argument("--once", action="store_true", help="只执行一轮就退出")

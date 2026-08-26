@@ -42,7 +42,7 @@ jobs:
         run: |
           python3 -u sukebei_scheduler.py --once \
             --initial-id "$INITIAL_ID" \
-            --output data/sukebei.jsonl \
+            --output "data/sukebei_{ts}.jsonl" \
             --state state/sukebei_state.json \
             --workers 3 \
             --min-delay 0.8 \

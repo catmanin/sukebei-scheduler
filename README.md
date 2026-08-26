@@ -18,22 +18,31 @@ pip install -r requirements.txt
 
 # 单次执行（首次：给定初始 ID）
 python sukebei_scheduler.py --once --initial-id 4693264 \
-  --output data/sukebei.jsonl --state state/sukebei_state.json
+  --state state/sukebei_state.json
 
 # 定时执行（每天一次）
 python sukebei_scheduler.py --initial-id 4693264 --interval 86400 \
-  --output data/sukebei.jsonl --state state/sukebei_state.json
+  --state state/sukebei_state.json
 
 # 走代理（配合 xray/rotator 的 socks 代理）
 python sukebei_scheduler.py --initial-id 4609903 --proxy socks5://127.0.0.1:10808
 ```
+
+### 输出文件
+
+- 默认输出到 `data/sukebei_{ts}.jsonl`，`{ts}` 为每轮运行时刻（`YYYYmmdd_HHMMSS`），**每轮一个独立文件，不会混写**
+- 区间内**每个 ID 都记录一条**（无论成功/404/429/错误/解析失败），带 `status` 标记：
+  - 成功：完整字段 + `"status": "ok"`
+  - 404/429/解析失败：`{"id": X, "status": "404"}`（无完整数据）
+  - 网络错误：`{"id": X, "status": "error", "error": "..."}`
+- 自定义输出路径也可用 `{ts}` 占位符：`--output my/sukebei_{ts}.jsonl`
 
 ### 参数
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--initial-id` | 必填 | 初始 ID（本地无状态时从它开始） |
-| `--output` | `sukebei.jsonl` | 输出 jsonl 文件 |
+| `--output` | `data/sukebei_{ts}.jsonl` | 输出 jsonl 文件（支持 `{ts}` 时间戳占位符） |
 | `--state` | `sukebei_state.json` | 水位线状态文件 |
 | `--interval` | `3600` | 定时间隔（秒） |
 | `--once` | off | 只执行一轮就退出 |
@@ -53,7 +62,7 @@ from sukebei_scheduler import run_schedule, check_and_crawl, crawl_range, parse_
 # 单轮决策：比较本地 max 与网站最新 ID，返回 True=本轮抓了新内容
 has_new = await check_and_crawl(
     initial_id=4609903,
-    output="data/sukebei.jsonl",
+    output="data/sukebei_{ts}.jsonl",
     state_file="state/sukebei_state.json",
     min_delay=0.8, max_delay=1.3, workers=2, proxy_url=None,
 )
