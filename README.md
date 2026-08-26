@@ -17,11 +17,11 @@ sukebei.nyaa.si 定时增量爬虫库 —— 给定初始 ID，每轮定时执�
 pip install -r requirements.txt
 
 # 单次执行（首次：给定初始 ID）
-python sukebei_scheduler.py --once --initial-id 4609903 \
+python sukebei_scheduler.py --once --initial-id 4693264 \
   --output data/sukebei.jsonl --state state/sukebei_state.json
 
-# 定时执行（每 6 小时）
-python sukebei_scheduler.py --initial-id 4609903 --interval 21600 \
+# 定时执行（每天一次）
+python sukebei_scheduler.py --initial-id 4693264 --interval 86400 \
   --output data/sukebei.jsonl --state state/sukebei_state.json
 
 # 走代理（配合 xray/rotator 的 socks 代理）
@@ -43,7 +43,7 @@ python sukebei_scheduler.py --initial-id 4609903 --proxy socks5://127.0.0.1:1080
 
 ## GitHub Actions 定时执行
 
-仓库内置 `.github/workflows/scheduled-crawl.yml`，默认每 6 小时自动跑一轮，结果和状态自动提交回仓库（可 `workflow_dispatch` 手动触发一次，传入 `initial_id` 覆盖起始值）。
+仓库内置 `.github/workflows/scheduled-crawl.yml`，默认每天自动跑一轮（约 750 条/天的新 ID 一次即可覆盖），结果和状态自动提交回仓库（可 `workflow_dispatch` 手动触发一次，传入 `initial_id` 覆盖起始值）。
 
 ## 作为库使用
 
