@@ -34,11 +34,13 @@ jobs:
 
       # ── 跑一轮定时爬虫 ──
       # 初始 ID 优先级: 手动触发输入 > 仓库变量 SUKEBEI_INITIAL_ID > 默认值
+      # -u: 无缓冲输出，进度实时显示在 Actions 日志里
       - name: Run one scheduled round
+        timeout-minutes: 60
         env:
           INITIAL_ID: ${{ inputs.initial_id || vars.SUKEBEI_INITIAL_ID || '4693264' }}
         run: |
-          python3 sukebei_scheduler.py --once \
+          python3 -u sukebei_scheduler.py --once \
             --initial-id "$INITIAL_ID" \
             --output data/sukebei.jsonl \
             --state state/sukebei_state.json \

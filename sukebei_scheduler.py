@@ -109,24 +109,43 @@ def parse_view(html, vid):
 # ---------------------------------------------------------------------------
 # 最新 ID
 # ---------------------------------------------------------------------------
-async def fetch_latest_id(session):
-    """抓取网站最新 ID。先试 RSS（首条即最新），失败回退列表页。"""
-    # 1) RSS: 第一条 <link>/<guid> 指向最新详情页
-    try:
-        resp = await session.get(RSS_URL, timeout=30)
-        resp.raise_for_status()
-        m = re.search(r"/view/(\d+)", resp.text)
-        if m:
-            return int(m.group(1))
-    except Exception as e:
-        print(f"  [!] RSS 获取失败({e}), 回退列表页")
+async def fetch_latest_id(session, retries=3):
+    """抓取网站最新 ID。先试 RSS（首条即最新），失败回退列表页。带重试，429/5xx 时退避。"""
+    for attempt in range(1, retries + 1):
+        try:
+            # 1) RSS: 第一条 <link>/<guid> 指向最新详情页
+            resp = await session.get(RSS_URL, timeout=30)
+            if resp.status_code == 429:
+                raise Exception("429")
+            resp.raise_for_status()
+            m = re.search(r"/view/(\d+)", resp.text)
+            if m:
+                return int(m.group(1))
+            raise Exception("RSS 无 /view/ 链接")
+        except Exception as e:
+            if attempt < retries:
+                print(f"  [!] 最新ID获取失败({e}), {BACKOFF_429_SEC}s 后重试 ({attempt}/{retries})", flush=True)
+                await asyncio.sleep(BACKOFF_429_SEC)
+            else:
+                print(f"  [!] RSS 获取失败({e}), 回退列表页", flush=True)
     # 2) 列表页: 第一个 /view/{id} 即最新
-    resp = await session.get(BASE_URL + "/", timeout=30)
-    resp.raise_for_status()
-    m = re.search(r"/view/(\d+)", resp.text)
-    if not m:
-        raise ValueError("无法从列表页解析最新 ID")
-    return int(m.group(1))
+    for attempt in range(1, retries + 1):
+        try:
+            resp = await session.get(BASE_URL + "/", timeout=30)
+            if resp.status_code == 429:
+                raise Exception("429")
+            resp.raise_for_status()
+            m = re.search(r"/view/(\d+)", resp.text)
+            if not m:
+                raise ValueError("无法从列表页解析最新 ID")
+            return int(m.group(1))
+        except Exception as e:
+            if attempt < retries:
+                print(f"  [!] 列表页获取失败({e}), {BACKOFF_429_SEC}s 后重试 ({attempt}/{retries})", flush=True)
+                await asyncio.sleep(BACKOFF_429_SEC)
+            else:
+                raise
+    raise ValueError("无法获取网站最新 ID")
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +203,8 @@ async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, p
         Path(output).parent.mkdir(parents=True, exist_ok=True)
         fh = open(output, "a", encoding="utf-8")
         try:
+            done = [0]  # 已完成计数（含失败）
+
             async def worker():
                 nonlocal attempted, found
                 while True:
@@ -192,41 +213,44 @@ async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, p
                     except asyncio.CancelledError:
                         return
                     try:
-                        await asyncio.sleep(random.uniform(min_delay, max_delay))
+                        # 内层 try/except 捕获所有请求错误 —— worker 永不崩溃
+                        item = None
+                        msg = ""
                         try:
+                            await asyncio.sleep(random.uniform(min_delay, max_delay))
                             resp = await session.get(VIEW_URL.format(vid), timeout=TIMEOUT)
-                        except Exception as e:
-                            print(f"    [err] #{vid}: {str(e)[:80]}")
-                            q.task_done()
-                            continue
-                        if resp.status_code == 404:
-                            msg = "404(已删除)"
-                        elif resp.status_code == 429:
-                            print(f"    [429] #{vid}, 冷却 {BACKOFF_429_SEC}s...")
-                            await asyncio.sleep(BACKOFF_429_SEC)
-                            q.task_done()
-                            continue
-                        else:
-                            resp.raise_for_status()
-                            item = parse_view(resp.text, vid)
-                            if item:
-                                async with lock:
-                                    fh.write(json.dumps(item, ensure_ascii=False) + "\n")
-                                    fh.flush()
-                                found += 1
-                                msg = "ok"
+                            if resp.status_code == 404:
+                                msg = "404(已删除)"
+                            elif resp.status_code == 429:
+                                msg = "429(冷却)"
+                                await asyncio.sleep(BACKOFF_429_SEC)
                             else:
-                                msg = "parse_fail"
-                        # 水位线推进（404 也算尝试过）
+                                resp.raise_for_status()
+                                item = parse_view(resp.text, vid)
+                                msg = "ok" if item else "parse_fail"
+                        except Exception as e:
+                            msg = f"err:{str(e)[:60]}"
+                        if item:
+                            async with lock:
+                                fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+                                fh.flush()
+                            found += 1
+                        # 水位线推进（404/失败也算尝试过）
                         async with lock:
                             if vid > attempted:
                                 attempted = vid
                             if (vid - (start_id - 1)) % WATERMARK_SAVE_EVERY == 0:
                                 save_state(state_file, attempted)
+                        done[0] += 1
+                        # 每 50 条打印一次进度，防 Actions 管道缓冲
+                        if done[0] % 50 == 0 or done[0] == total:
+                            print(f"    [{done[0]}/{total}] #{vid} {msg}", flush=True)
                         if progress_cb:
                             progress_cb(vid, total, found)
+                    except Exception as e:
+                        print(f"    [warn] #{vid} 未捕获异常: {str(e)[:80]}", flush=True)
                     finally:
-                        q.task_done()
+                        q.task_done()  # 恰好一次，保证 q.join() 能完成
 
             q = asyncio.Queue(maxsize=workers * 20)
             tasks = [asyncio.create_task(worker()) for _ in range(workers)]
