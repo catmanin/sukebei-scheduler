@@ -7,8 +7,8 @@ sukebei_scheduler — sukebei.nyaa.si 定时增量爬虫库
   1. 读本地状态文件，取「本地最大已尝试 ID」（首次用 --initial-id）
   2. 抓 sukebei.nyaa.si 列表页 / RSS，取「网站最新 ID」
   3. 比较：
-       - 最新 > 本地max → 抓取区间 [本地max+1, 最新] 的详情页，逐条写入 output
-       - 最新 <= 本地max → 无新内容，跳过本轮，等待下次定时执行
+        - 最新 > 本地max → 抓取区间 [本地max+1, 最新] 的详情页，逐条写入 output
+        - 最新 <= 本地max → 无新内容，跳过本轮，等待下次定时执行
   4. 404 也算「已尝试」（删除/下架的条目），水位线照常推进，避免每轮重复请求
 
 既可作库被 import，也可命令行直接跑：
@@ -48,10 +48,11 @@ H = {
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
-TIMEOUT = 25
+TIMEOUT = 20
 WATERMARK_SAVE_EVERY = 200          # 每抓 N 条保存一次水位线（崩溃安全）
-BACKOFF_429_SEC = 30                # 429 后的冷却
+BACKOFF_429_SEC = 10                # 429/403/临时错误后的冷却
 MAX_RETRIES = 3                     # 429/网络错误/解析失败的最大重试次数
+PROGRESS_EVERY = 10                 # 每 N 条打印一次进度（更容易看到卡在哪）
 
 # ---------------------------------------------------------------------------
 # 解析
@@ -115,7 +116,6 @@ async def fetch_latest_id(session, retries=3):
     """抓取网站最新 ID。先试 RSS（首条即最新），失败回退列表页。带重试，429/5xx 时退避。"""
     for attempt in range(1, retries + 1):
         try:
-            # 1) RSS: 第一条 <link>/<guid> 指向最新详情页
             resp = await session.get(RSS_URL, timeout=30)
             if resp.status_code == 429:
                 raise Exception("429")
@@ -130,7 +130,6 @@ async def fetch_latest_id(session, retries=3):
                 await asyncio.sleep(BACKOFF_429_SEC)
             else:
                 print(f"  [!] RSS 获取失败({e}), 回退列表页", flush=True)
-    # 2) 列表页: 第一个 /view/{id} 即最新
     for attempt in range(1, retries + 1):
         try:
             resp = await session.get(BASE_URL + "/", timeout=30)
@@ -177,7 +176,7 @@ def save_state(state_file, max_attempted):
 def local_max(state_file, initial_id):
     """取本轮起点: 状态水位线存在则用之, 否则 initial_id - 1。"""
     st = load_state(state_file)
-    if st and st.get("max_attempted"):
+    if st and st.get("max_attempted") is not None:
         return int(st["max_attempted"])
     return initial_id - 1
 
@@ -210,7 +209,7 @@ async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, p
         Path(output).parent.mkdir(parents=True, exist_ok=True)
         fh = open(output, "a", encoding="utf-8")
         try:
-            done = [0]  # 已完成计数（含失败）
+            done = [0]
 
             async def worker():
                 nonlocal attempted, found
@@ -219,39 +218,76 @@ async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, p
                         vid = await q.get()
                     except asyncio.CancelledError:
                         return
+
                     try:
-                        # 内层 try/except 捕获所有请求错误 —— worker 永不崩溃
-                        # 429/网络错误/解析失败自动重试 MAX_RETRIES 次（退避），
-                        # 404 不重试（永久状态）；重试耗尽后记录状态并推进水位线
                         item = None
                         status = "error"
                         err_msg = ""
+
+                        # 记录开始，方便看到 "卡住在哪个 ID"
+                        print(f"    [start] #{vid}", flush=True)
+
                         for attempt in range(1, MAX_RETRIES + 1):
                             try:
                                 await asyncio.sleep(random.uniform(min_delay, max_delay))
                                 resp = await session.get(VIEW_URL.format(vid), timeout=TIMEOUT)
+
+                                # 站点可能固定返回 403/429/5xx；显式记录，避免只看到 generic error
                                 if resp.status_code == 404:
                                     status = "404"
+                                    err_msg = "HTTP 404"
                                     break
                                 if resp.status_code == 429:
                                     status = "429"
-                                    await asyncio.sleep(BACKOFF_429_SEC)
-                                    continue
+                                    err_msg = f"HTTP 429"
+                                    if attempt < MAX_RETRIES:
+                                        print(f"    [retry] #{vid} attempt {attempt}/{MAX_RETRIES} -> {status} {err_msg}, sleep {BACKOFF_429_SEC}s", flush=True)
+                                        await asyncio.sleep(BACKOFF_429_SEC)
+                                        continue
+                                    break
+                                if 400 <= resp.status_code < 500:
+                                    status = f"http_{resp.status_code}"
+                                    err_msg = f"HTTP {resp.status_code}"
+                                    if attempt < MAX_RETRIES:
+                                        print(f"    [retry] #{vid} attempt {attempt}/{MAX_RETRIES} -> {status} {err_msg}, sleep {BACKOFF_429_SEC}s", flush=True)
+                                        await asyncio.sleep(BACKOFF_429_SEC)
+                                        continue
+                                    break
+                                if resp.status_code >= 500:
+                                    status = f"http_{resp.status_code}"
+                                    err_msg = f"HTTP {resp.status_code}"
+                                    if attempt < MAX_RETRIES:
+                                        print(f"    [retry] #{vid} attempt {attempt}/{MAX_RETRIES} -> {status} {err_msg}, sleep {BACKOFF_429_SEC}s", flush=True)
+                                        await asyncio.sleep(BACKOFF_429_SEC)
+                                        continue
+                                    break
+
                                 resp.raise_for_status()
                                 item = parse_view(resp.text, vid)
-                                status = "ok" if item else "parse_fail"
                                 if item:
+                                    status = "ok"
+                                    err_msg = ""
                                     break
+                                status = "parse_fail"
+                                err_msg = "parse_view returned None"
+                                if attempt < MAX_RETRIES:
+                                    print(f"    [retry] #{vid} attempt {attempt}/{MAX_RETRIES} -> {status} {err_msg}, sleep {BACKOFF_429_SEC}s", flush=True)
+                                    await asyncio.sleep(BACKOFF_429_SEC)
+                                    continue
+                            except asyncio.TimeoutError:
+                                status = "timeout"
+                                err_msg = "asyncio timeout"
                             except Exception as e:
-                                err_msg = str(e)[:100]
                                 status = "error"
-                            # 重试之间退避
+                                err_msg = str(e)[:180]
+
                             if attempt < MAX_RETRIES:
+                                print(f"    [retry] #{vid} attempt {attempt}/{MAX_RETRIES} -> {status} {err_msg}, sleep {BACKOFF_429_SEC}s", flush=True)
                                 await asyncio.sleep(BACKOFF_429_SEC)
-                        # 成功重试到 item 后, 清掉残留 err_msg
+
+                        # 清理结果
                         if item:
                             err_msg = ""
-                        # 无论成功/404/429/错误/解析失败，每个 ID 都写入一条（带状态标记）
                         if item:
                             rec = item
                             rec["status"] = "ok"
@@ -259,38 +295,40 @@ async def crawl_range(start_id, end_id, output, min_delay, max_delay, workers, p
                             rec = {"id": vid, "status": status}
                             if err_msg:
                                 rec["error"] = err_msg
+
                         async with lock:
                             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                             fh.flush()
+
                         if item:
                             found += 1
-                        # 水位线推进（404/失败也算尝试过）
+
+                        # 水位线推进：404、429、timeout、解析失败都算已尝试过，避免循环重复请求
                         async with lock:
                             if vid > attempted:
                                 attempted = vid
                             if (vid - (start_id - 1)) % WATERMARK_SAVE_EVERY == 0:
                                 save_state(state_file, attempted)
+
                         done[0] += 1
-                        # 每 50 条打印一次进度，防 Actions 管道缓冲
-                        if done[0] % 50 == 0 or done[0] == total:
-                            print(f"    [{done[0]}/{total}] #{vid} {status}", flush=True)
+                        if done[0] % PROGRESS_EVERY == 0 or done[0] == total:
+                            print(f"    [{done[0]}/{total}] #{vid} {status} {err_msg if err_msg else ''}".strip(), flush=True)
                         if progress_cb:
                             progress_cb(vid, total, found)
                     except Exception as e:
-                        print(f"    [warn] #{vid} 未捕获异常: {str(e)[:80]}", flush=True)
+                        print(f"    [warn] #{vid} 未捕获异常: {str(e)[:120]}", flush=True)
                     finally:
-                        q.task_done()  # 恰好一次，保证 q.join() 能完成
+                        q.task_done()
 
             q = asyncio.Queue(maxsize=workers * 20)
             tasks = [asyncio.create_task(worker()) for _ in range(workers)]
             stopped_at = None
             for vid in ids:
-                # 达到时长上限: 停止入队新 ID, 剩余的交由下一轮
                 if deadline is not None and time.time() > deadline:
                     stopped_at = vid
                     break
                 await q.put(vid)
-            await q.join()  # 已在队列中的任务全部消费完
+            await q.join()
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -322,7 +360,6 @@ async def check_and_crawl(initial_id, output, state_file, min_delay, max_delay,
 
     if site_max < start_id:
         print(f"[*] 无新内容 (最新 {site_max} < 本地起点 {start_id}), 停止本轮, 等下次定时执行")
-        # 保持原水位线: site_max 可能是 RSS 缓存的旧值, 绝不能把水位线回退
         save_state(state_file, start_id - 1)
         return False, 0
 
@@ -347,7 +384,6 @@ def run_schedule(initial_id, output, state_file, interval, min_delay, max_delay,
     """
     while True:
         started = time.time()
-        # 每轮生成带时间戳的输出文件
         out_path = str(output).replace("{ts}", datetime.now().strftime("%Y%m%d_%H%M%S"))
         try:
             has_new, remaining = asyncio.run(
@@ -356,7 +392,6 @@ def run_schedule(initial_id, output, state_file, interval, min_delay, max_delay,
                                 max_duration=max_duration))
             if remaining > 0:
                 print(f"[*] 本轮超时中断, 剩余 {remaining} 个 ID, 由下一轮续跑", flush=True)
-            # GitHub Actions 输出: has_more=true 时工作流自触发下一轮
             if os.environ.get("GITHUB_OUTPUT"):
                 with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
                     f.write(f"has_more={'true' if remaining > 0 else 'false'}\n")
@@ -367,8 +402,6 @@ def run_schedule(initial_id, output, state_file, interval, min_delay, max_delay,
         except Exception as e:
             print(f"[!] 本轮异常: {e}", flush=True)
             if once:
-                # 单轮模式（Actions）: 异常直接失败退出, 让工作流看到红色失败,
-                # 而不是吞掉异常假装成功
                 raise
         if once:
             break
@@ -403,7 +436,6 @@ def main(argv=None):
     print(f"[*] sukebei 定时爬虫 | initial={a.initial_id} | interval={a.interval}s "
           f"| once={a.once} | output={a.output} | reset={a.reset}")
     if a.reset:
-        # 重置: 清掉状态文件, 让 local_max 回落为 initial_id - 1
         st_path = Path(a.state)
         if st_path.exists():
             st_path.unlink()
